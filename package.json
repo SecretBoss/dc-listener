@@ -1,0 +1,16 @@
+{
+  "name": "penni-discord-listener",
+  "version": "1.0.0",
+  "description": "24/7 Discord Gateway listener that logs message/reaction/voice activity for Penni raffle boosts.",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3"
+  }
+}
