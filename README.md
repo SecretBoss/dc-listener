@@ -46,10 +46,10 @@ In Railway → your service → **Variables**:
 | `DISCORD_BOT_TOKEN` | Same token your existing Penni bot uses, **or** a new bot invited to the server |
 | `GUILD_ID` | `1388614650895138898` |
 | `INGEST_URL` | `https://jmrnfwrmowkgejufeprg.supabase.co/functions/v1/ingest-discord-activity` |
-| `INGEST_TOKEN` | The value of `DISCORD_LISTENER_INGEST_TOKEN` you set in Lovable Cloud secrets |
+| `INGEST_TOKEN` | The value of `DISCORD_LISTENER_INGEST_TOKEN` you set in Cloud secrets |
 
 > You generated `DISCORD_LISTENER_INGEST_TOKEN` when wiring this up. Use the
-> exact same string here. To rotate later, update both places (Lovable Cloud
+> exact same string here. To rotate later, update both places (Cloud
 > secret + Railway variable) at the same time.
 
 ### 4. Enable the right Discord intents
