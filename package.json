@@ -11,6 +11,9 @@
     "node": ">=20"
   },
   "dependencies": {
-    "discord.js": "^14.16.3"
+    "@opensea/stream-js": "^0.3.1",
+    "discord.js": "^14.16.3",
+    "phoenix": "^1.8.5",
+    "ws": "^8.20.0"
   }
 }

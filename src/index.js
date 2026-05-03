@@ -27,6 +27,7 @@
 //   - GUILD_VOICE_STATES
 
 import { Client, GatewayIntentBits, Events } from "discord.js";
+import { startSweepDetector } from "./sweepDetector.js";
 
 const {
   DISCORD_BOT_TOKEN,
@@ -145,6 +146,7 @@ client.on(Events.MessageReactionAdd, (reaction, user) => {
 client.once(Events.ClientReady, (c) => {
   console.log(`[ready] logged in as ${c.user.tag}, watching guild ${GUILD_ID}`);
   console.log(`[ready] forwarding to ${INGEST_URL}`);
+  startSweepDetector().catch((e) => console.error("[sweep] failed to start", e));
 });
 
 client.on("error", (err) => console.error("[discord error]", err));
