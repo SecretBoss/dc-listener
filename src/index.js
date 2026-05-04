@@ -169,9 +169,13 @@ const sweepCommand = new SlashCommandBuilder()
 async function registerSlashCommands(appId) {
   const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
   try {
-    await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), {
-      body: [sweepCommand.toJSON()],
-    });
+    const commands = await rest.get(Routes.applicationGuildCommands(appId, GUILD_ID));
+    const existing = Array.isArray(commands) ? commands.find((cmd) => cmd.name === "sweep") : null;
+    if (existing?.id) {
+      await rest.patch(Routes.applicationGuildCommand(appId, GUILD_ID, existing.id), { body: sweepCommand.toJSON() });
+    } else {
+      await rest.post(Routes.applicationGuildCommands(appId, GUILD_ID), { body: sweepCommand.toJSON() });
+    }
     console.log("[slash] registered /sweep in guild", GUILD_ID);
   } catch (e) {
     console.error("[slash] register failed", e?.message ?? e);

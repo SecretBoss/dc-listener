@@ -13,6 +13,7 @@
 //   SWEEP_WINDOW_MS            — sliding window in ms (default 60000)
 //   SWEEP_COOLDOWN_MS          — per-collection cooldown after alert (default 300000)
 //   TOP_COLLECTIONS_COUNT      — how many top collections to track (default 200)
+//   INGEST_URL / INGEST_TOKEN   — used to pull live /sweep config from backend
 
 import { OpenSeaStreamClient, Network } from "@opensea/stream-js";
 import { WebSocket } from "ws";
@@ -25,23 +26,50 @@ const {
   SWEEP_WINDOW_MS = "60000",
   SWEEP_COOLDOWN_MS = "300000",
   TOP_COLLECTIONS_COUNT = "200",
+  INGEST_URL,
+  INGEST_TOKEN,
 } = process.env;
 
 // Mutable at runtime via setSweepConfig() so Discord commands can tune live.
 let THRESHOLD = Number(SWEEP_THRESHOLD);
 let WINDOW_MS = Number(SWEEP_WINDOW_MS);
 let COOLDOWN_MS = Number(SWEEP_COOLDOWN_MS);
+let PING_ROLE_ID = "0";
+let ETH_USD = null;
 const TOP_N = Number(TOP_COLLECTIONS_COUNT);
 
 export function getSweepConfig() {
-  return { threshold: THRESHOLD, windowMs: WINDOW_MS, cooldownMs: COOLDOWN_MS, tracked: collectionMeta.size };
+  return { threshold: THRESHOLD, windowMs: WINDOW_MS, cooldownMs: COOLDOWN_MS, pingRoleId: PING_ROLE_ID, ethUsd: ETH_USD, tracked: collectionMeta.size };
 }
 
-export function setSweepConfig({ threshold, windowMs, cooldownMs } = {}) {
+export function setSweepConfig({ threshold, windowMs, cooldownMs, pingRoleId, ethUsd } = {}) {
   if (Number.isFinite(threshold) && threshold > 0) THRESHOLD = Math.floor(threshold);
   if (Number.isFinite(windowMs) && windowMs >= 1000) WINDOW_MS = Math.floor(windowMs);
   if (Number.isFinite(cooldownMs) && cooldownMs >= 0) COOLDOWN_MS = Math.floor(cooldownMs);
+  if (typeof pingRoleId === "string" && /^\d+$/.test(pingRoleId)) PING_ROLE_ID = pingRoleId;
+  if (Number.isFinite(ethUsd) && ethUsd > 0) ETH_USD = ethUsd;
   return getSweepConfig();
+}
+
+async function refreshSweepConfig() {
+  if (!INGEST_URL || !INGEST_TOKEN) return;
+  try {
+    const res = await fetch(INGEST_URL, { headers: { "x-ingest-token": INGEST_TOKEN } });
+    if (!res.ok) {
+      console.error(`[sweep config] HTTP ${res.status}: ${await res.text().catch(() => "")}`);
+      return;
+    }
+    const cfg = await res.json();
+    setSweepConfig({
+      threshold: Number(cfg.sweep_threshold),
+      windowMs: Number(cfg.sweep_window_ms),
+      cooldownMs: Number(cfg.sweep_cooldown_ms),
+      pingRoleId: String(cfg.sweep_ping_role_id ?? "0"),
+      ethUsd: Number(cfg.eth_usd),
+    });
+  } catch (e) {
+    console.error("[sweep config] refresh failed", e?.message ?? e);
+  }
 }
 
 const sales = new Map(); // slug -> [{ ts, priceEth, image, name, slug }]
@@ -61,6 +89,8 @@ export async function startSweepDetector() {
     return;
   }
 
+  await refreshSweepConfig();
+  setInterval(refreshSweepConfig, 30_000);
   await subscribeTopCollections();
 
   // Refresh the top-N list every 24h. We tear down existing sockets and
@@ -170,6 +200,15 @@ function handleSale(slug, event) {
     // Only count ETH/WETH sales.
     if (!["ETH", "WETH"].includes(symbol)) return;
 
+    // Sweep = ONE buyer scooping many items. Keep only buy-side events by
+    // identifying the taker (buyer) wallet. WETH bid-fills have the buyer as
+    // the maker — we treat those as sells (collection offers being accepted)
+    // and ignore them here so we don't mistake "10 different sellers
+    // accepting bids" for a sweep.
+    const taker = String(payload.taker?.address ?? "").toLowerCase();
+    if (!taker) return;
+    if (symbol === "WETH") return; // WETH = bid acceptance, not a buy-side sweep
+
     const priceEth = Number(sale) / Math.pow(10, decimals);
     const now = Date.now();
 
@@ -180,8 +219,7 @@ function handleSale(slug, event) {
     if (!collectionMeta.has(slug)) collectionMeta.set(slug, meta);
 
     const arr = sales.get(slug) ?? [];
-    arr.push({ ts: now, priceEth });
-    // Drop expired entries.
+    arr.push({ ts: now, priceEth, buyer: taker });
     const cutoff = now - WINDOW_MS;
     while (arr.length && arr[0].ts < cutoff) arr.shift();
     sales.set(slug, arr);
@@ -197,27 +235,40 @@ function handleSale(slug, event) {
   }
 }
 
+function fmtUsd(eth) {
+  if (!ETH_USD || !Number.isFinite(eth)) return "";
+  const usd = eth * ETH_USD;
+  const formatted = usd >= 1000
+    ? `$${Math.round(usd).toLocaleString("en-US")}`
+    : `$${usd.toFixed(2)}`;
+  return ` (${formatted})`;
+}
+
 async function postSweepAlert(slug, meta, window) {
   const count = window.length;
   const totalEth = window.reduce((s, x) => s + x.priceEth, 0);
   const avgEth = totalEth / count;
   const minEth = Math.min(...window.map((x) => x.priceEth));
+  const uniqueBuyers = new Set(window.map((x) => x.buyer).filter(Boolean)).size;
   const slugUrl = `https://opensea.io/collection/${slug}`;
 
   const embed = {
     title: `🧹 Sweep detected: ${meta.name}`,
     url: slugUrl,
     color: 0xf59e0b,
-    description: `**${count}** sales in the last ${Math.round(WINDOW_MS / 1000)}s`,
+    description: `**${count}** buys in the last ${Math.round(WINDOW_MS / 1000)}s · ${uniqueBuyers} buyer${uniqueBuyers === 1 ? "" : "s"}`,
     fields: [
-      { name: "Total Volume", value: `${totalEth.toFixed(3)} ETH`, inline: true },
-      { name: "Avg Price", value: `${avgEth.toFixed(4)} ETH`, inline: true },
-      { name: "Floor in Sweep", value: `${minEth.toFixed(4)} ETH`, inline: true },
+      { name: "Total Volume", value: `${totalEth.toFixed(3)} ETH${fmtUsd(totalEth)}`, inline: true },
+      { name: "Avg Price", value: `${avgEth.toFixed(4)} ETH${fmtUsd(avgEth)}`, inline: true },
+      { name: "Floor in Sweep", value: `${minEth.toFixed(4)} ETH${fmtUsd(minEth)}`, inline: true },
       { name: "Collection", value: `[View on OpenSea](${slugUrl})`, inline: false },
     ],
     timestamp: new Date().toISOString(),
   };
   if (meta.image) embed.thumbnail = { url: meta.image };
+
+  const content = PING_ROLE_ID && PING_ROLE_ID !== "0" ? `<@&${PING_ROLE_ID}>` : undefined;
+  const allowed_mentions = content ? { parse: [], roles: [PING_ROLE_ID] } : { parse: [] };
 
   try {
     const res = await fetch(
@@ -228,7 +279,7 @@ async function postSweepAlert(slug, meta, window) {
           "Content-Type": "application/json",
           Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
         },
-        body: JSON.stringify({ embeds: [embed], allowed_mentions: { parse: [] } }),
+        body: JSON.stringify({ ...(content ? { content } : {}), embeds: [embed], allowed_mentions }),
       },
     );
     if (!res.ok) {
