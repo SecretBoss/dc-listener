@@ -49,26 +49,39 @@ export async function startSweepDetector() {
   }
   console.log(`[sweep] tracking ${slugs.length} collections, threshold=${THRESHOLD} in ${WINDOW_MS}ms`);
 
-  const client = new OpenSeaStreamClient({
-    network: Network.MAINNET,
-    token: OPENSEA_API_KEY,
-    connectOptions: { transport: WebSocket },
-    onError: (err) => console.error("[sweep stream error]", err?.message ?? err),
-  });
+  // OpenSea Stream caps channel joins per WebSocket connection (~50). To track
+  // 200 collections we shard the slug list across multiple Stream clients —
+  // each opens its own websocket — and stagger joins to avoid rate limits.
+  const SHARD_SIZE = Number(process.env.SWEEP_SHARD_SIZE ?? "40");
+  const JOIN_DELAY_MS = Number(process.env.SWEEP_JOIN_DELAY_MS ?? "100");
+  const shards = [];
+  for (let i = 0; i < slugs.length; i += SHARD_SIZE) {
+    shards.push(slugs.slice(i, i + SHARD_SIZE));
+  }
+  console.log(`[sweep] sharding ${slugs.length} slugs into ${shards.length} sockets (size=${SHARD_SIZE})`);
 
-  // Locate the underlying Phoenix socket (SDK keeps it on different keys
-  // depending on version). We'll inspect channel state after subscribing.
-  const sdkSocket =
-    client?.socket?.socket ??
-    client?.socket ??
-    client?._socket ??
-    null;
+  const sdkSockets = [];
+  for (let s = 0; s < shards.length; s++) {
+    const shard = shards[s];
+    const client = new OpenSeaStreamClient({
+      network: Network.MAINNET,
+      token: OPENSEA_API_KEY,
+      connectOptions: { transport: WebSocket },
+      onError: (err) => console.error(`[sweep stream error shard ${s}]`, err?.message ?? err),
+    });
+    const sdkSocket =
+      client?.socket?.socket ?? client?.socket ?? client?._socket ?? null;
+    sdkSockets.push(sdkSocket);
 
-  for (const slug of slugs) {
-    try {
-      client.onItemSold(slug, (event) => handleSale(slug, event));
-    } catch (e) {
-      console.error(`[sweep] subscribe failed for ${slug}`, e?.message ?? e);
+    for (let i = 0; i < shard.length; i++) {
+      const slug = shard[i];
+      // Stagger joins so Phoenix doesn't drop bursts.
+      await new Promise((r) => setTimeout(r, JOIN_DELAY_MS));
+      try {
+        client.onItemSold(slug, (event) => handleSale(slug, event));
+      } catch (e) {
+        console.error(`[sweep] subscribe failed for ${slug}`, e?.message ?? e);
+      }
     }
   }
 
@@ -78,27 +91,29 @@ export async function startSweepDetector() {
     let failed = 0;
     let pending = 0;
     const failedSlugs = [];
-    const channels = sdkSocket?.channels ?? [];
-    for (const ch of channels) {
-      const topic = ch?.topic ?? "";
-      if (!topic.startsWith("collection:")) continue;
-      const slug = topic.slice("collection:".length);
-      const state = typeof ch?.state === "string" ? ch.state : "unknown";
-      if (state === "joined") joined++;
-      else if (state === "errored" || state === "closed") {
-        failed++;
-        failedSlugs.push(slug);
-      } else {
-        pending++;
+    for (const sdkSocket of sdkSockets) {
+      const channels = sdkSocket?.channels ?? [];
+      for (const ch of channels) {
+        const topic = ch?.topic ?? "";
+        if (!topic.startsWith("collection:")) continue;
+        const slug = topic.slice("collection:".length);
+        const state = typeof ch?.state === "string" ? ch.state : "unknown";
+        if (state === "joined") joined++;
+        else if (state === "errored" || state === "closed") {
+          failed++;
+          failedSlugs.push(slug);
+        } else {
+          pending++;
+        }
       }
     }
     console.log(
-      `[sweep] subscription summary — attempted=${slugs.length}, joined=${joined}, failed=${failed}, pending=${pending}`,
+      `[sweep] subscription summary — attempted=${slugs.length}, sockets=${sdkSockets.length}, joined=${joined}, failed=${failed}, pending=${pending}`,
     );
     if (failedSlugs.length) {
       console.log(`[sweep] failed slugs (${failedSlugs.length}): ${failedSlugs.join(", ")}`);
     }
-  }, 30_000);
+  }, 60_000);
 
   // Refresh top list every 24h.
   setInterval(async () => {
