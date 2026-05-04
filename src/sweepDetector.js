@@ -56,50 +56,42 @@ export async function startSweepDetector() {
     onError: (err) => console.error("[sweep stream error]", err?.message ?? err),
   });
 
-  let joined = 0;
-  let failed = 0;
-  let pending = slugs.length;
-  const failedSlugs = [];
-
-  // Patch Phoenix's logger so we can intercept join results without losing
-  // the underlying SDK behavior. The SDK calls logger("info"|"error", msg).
-  const sdkSocket = client?.socket ?? client?._socket;
-  if (sdkSocket && typeof sdkSocket.logger === "function") {
-    const originalLogger = sdkSocket.logger.bind(sdkSocket);
-    sdkSocket.logger = (kind, msg, data) => {
-      try {
-        if (typeof msg === "string" && msg.includes("collection:")) {
-          const m = msg.match(/collection:([a-z0-9-]+)/i);
-          const slug = m?.[1];
-          if (slug) {
-            if (msg.toLowerCase().includes("successfully joined")) {
-              joined++;
-              pending--;
-            } else if (msg.toLowerCase().includes("failed to join")) {
-              failed++;
-              pending--;
-              failedSlugs.push(slug);
-            }
-          }
-        }
-      } catch { /* ignore */ }
-      return originalLogger(kind, msg, data);
-    };
-  }
+  // Locate the underlying Phoenix socket (SDK keeps it on different keys
+  // depending on version). We'll inspect channel state after subscribing.
+  const sdkSocket =
+    client?.socket?.socket ??
+    client?.socket ??
+    client?._socket ??
+    null;
 
   for (const slug of slugs) {
     try {
       client.onItemSold(slug, (event) => handleSale(slug, event));
     } catch (e) {
-      failed++;
-      pending--;
-      failedSlugs.push(slug);
       console.error(`[sweep] subscribe failed for ${slug}`, e?.message ?? e);
     }
   }
 
   // Report final tally once Phoenix has had time to process all joins.
   setTimeout(() => {
+    let joined = 0;
+    let failed = 0;
+    let pending = 0;
+    const failedSlugs = [];
+    const channels = sdkSocket?.channels ?? [];
+    for (const ch of channels) {
+      const topic = ch?.topic ?? "";
+      if (!topic.startsWith("collection:")) continue;
+      const slug = topic.slice("collection:".length);
+      const state = typeof ch?.state === "string" ? ch.state : "unknown";
+      if (state === "joined") joined++;
+      else if (state === "errored" || state === "closed") {
+        failed++;
+        failedSlugs.push(slug);
+      } else {
+        pending++;
+      }
+    }
     console.log(
       `[sweep] subscription summary — attempted=${slugs.length}, joined=${joined}, failed=${failed}, pending=${pending}`,
     );
