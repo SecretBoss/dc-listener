@@ -26,8 +26,8 @@
 //   - GUILD_MESSAGE_REACTIONS
 //   - GUILD_VOICE_STATES
 
-import { Client, GatewayIntentBits, Events } from "discord.js";
-import { startSweepDetector } from "./sweepDetector.js";
+import { Client, GatewayIntentBits, Events, REST, Routes, SlashCommandBuilder, MessageFlags } from "discord.js";
+import { startSweepDetector, setSweepConfig, getSweepConfig } from "./sweepDetector.js";
 
 const {
   DISCORD_BOT_TOKEN,
@@ -43,6 +43,10 @@ for (const [k, v] of Object.entries({ DISCORD_BOT_TOKEN, GUILD_ID, INGEST_URL, I
     process.exit(1);
   }
 }
+
+// Hardcoded: only these Discord user IDs may run /sweep, and only in this channel.
+const SWEEP_ADMINS = new Set(["535883101302292480", "257150199003217920"]);
+const SWEEP_COMMAND_CHANNEL_ID = "1500830957748621312";
 
 const client = new Client({
   intents: [
@@ -132,6 +136,83 @@ client.on(Events.MessageCreate, (msg) => {
   });
 });
 
+// -------- Slash commands (/sweep ...) --------
+const sweepCommand = new SlashCommandBuilder()
+  .setName("sweep")
+  .setDescription("Configure NFT sweep alert detector")
+  .addSubcommand((s) => s.setName("status").setDescription("Show current sweep config"))
+  .addSubcommand((s) =>
+    s
+      .setName("threshold")
+      .setDescription("Set how many sales within the window trigger an alert")
+      .addIntegerOption((o) =>
+        o.setName("value").setDescription("Sales count (>=1)").setRequired(true).setMinValue(1).setMaxValue(1000),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("window")
+      .setDescription("Set the sliding window (in seconds) used to count sales")
+      .addIntegerOption((o) =>
+        o.setName("seconds").setDescription("Window length in seconds (>=1)").setRequired(true).setMinValue(1).setMaxValue(86400),
+      ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("cooldown")
+      .setDescription("Set the per-collection cooldown (in seconds) after an alert")
+      .addIntegerOption((o) =>
+        o.setName("seconds").setDescription("Cooldown in seconds (>=0)").setRequired(true).setMinValue(0).setMaxValue(86400),
+      ),
+  );
+
+async function registerSlashCommands(appId) {
+  const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
+  try {
+    await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), {
+      body: [sweepCommand.toJSON()],
+    });
+    console.log("[slash] registered /sweep in guild", GUILD_ID);
+  } catch (e) {
+    console.error("[slash] register failed", e?.message ?? e);
+  }
+}
+
+client.on(Events.InteractionCreate, async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== "sweep") return;
+
+  if (!SWEEP_ADMINS.has(interaction.user.id)) {
+    await interaction.reply({ content: "⛔ not authorized", flags: MessageFlags.Ephemeral }).catch(() => {});
+    return;
+  }
+  if (interaction.channelId !== SWEEP_COMMAND_CHANNEL_ID) {
+    await interaction.reply({
+      content: `⛔ this command can only be used in <#${SWEEP_COMMAND_CHANNEL_ID}>`,
+      flags: MessageFlags.Ephemeral,
+    }).catch(() => {});
+    return;
+  }
+
+  try {
+    const sub = interaction.options.getSubcommand();
+    let cfg;
+    if (sub === "status") cfg = getSweepConfig();
+    else if (sub === "threshold") cfg = setSweepConfig({ threshold: interaction.options.getInteger("value", true) });
+    else if (sub === "window") cfg = setSweepConfig({ windowMs: interaction.options.getInteger("seconds", true) * 1000 });
+    else if (sub === "cooldown") cfg = setSweepConfig({ cooldownMs: interaction.options.getInteger("seconds", true) * 1000 });
+    else {
+      await interaction.reply({ content: "unknown subcommand", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.reply(
+      `🧹 sweep config — threshold=**${cfg.threshold}** sales / **${Math.round(cfg.windowMs / 1000)}s** window, cooldown=**${Math.round(cfg.cooldownMs / 1000)}s**, tracking **${cfg.tracked}** collections`,
+    );
+  } catch (e) {
+    await interaction.reply({ content: `error: ${e?.message ?? e}`, flags: MessageFlags.Ephemeral }).catch(() => {});
+  }
+});
+
 // -------- Reactions --------
 client.on(Events.MessageReactionAdd, (reaction, user) => {
   if (user?.bot) return;
@@ -146,6 +227,7 @@ client.on(Events.MessageReactionAdd, (reaction, user) => {
 client.once(Events.ClientReady, (c) => {
   console.log(`[ready] logged in as ${c.user.tag}, watching guild ${GUILD_ID}`);
   console.log(`[ready] forwarding to ${INGEST_URL}`);
+  registerSlashCommands(c.user.id).catch((e) => console.error("[slash] failed", e));
   startSweepDetector().catch((e) => console.error("[sweep] failed to start", e));
 });
 
