@@ -27,14 +27,33 @@ const {
   TOP_COLLECTIONS_COUNT = "200",
 } = process.env;
 
-const THRESHOLD = Number(SWEEP_THRESHOLD);
-const WINDOW_MS = Number(SWEEP_WINDOW_MS);
-const COOLDOWN_MS = Number(SWEEP_COOLDOWN_MS);
+// Mutable at runtime via setSweepConfig() so Discord commands can tune live.
+let THRESHOLD = Number(SWEEP_THRESHOLD);
+let WINDOW_MS = Number(SWEEP_WINDOW_MS);
+let COOLDOWN_MS = Number(SWEEP_COOLDOWN_MS);
 const TOP_N = Number(TOP_COLLECTIONS_COUNT);
+
+export function getSweepConfig() {
+  return { threshold: THRESHOLD, windowMs: WINDOW_MS, cooldownMs: COOLDOWN_MS, tracked: collectionMeta.size };
+}
+
+export function setSweepConfig({ threshold, windowMs, cooldownMs } = {}) {
+  if (Number.isFinite(threshold) && threshold > 0) THRESHOLD = Math.floor(threshold);
+  if (Number.isFinite(windowMs) && windowMs >= 1000) WINDOW_MS = Math.floor(windowMs);
+  if (Number.isFinite(cooldownMs) && cooldownMs >= 0) COOLDOWN_MS = Math.floor(cooldownMs);
+  return getSweepConfig();
+}
 
 const sales = new Map(); // slug -> [{ ts, priceEth, image, name, slug }]
 const lastAlertAt = new Map(); // slug -> ts
 const collectionMeta = new Map(); // slug -> { name, image }
+
+// Active stream clients across all shards. Kept at module scope so the
+// daily refresh can tear them down and rebuild against the new top list.
+let activeClients = [];
+
+const SHARD_SIZE = Number(process.env.SWEEP_SHARD_SIZE ?? "40");
+const JOIN_DELAY_MS = Number(process.env.SWEEP_JOIN_DELAY_MS ?? "100");
 
 export async function startSweepDetector() {
   if (!OPENSEA_API_KEY || !DISCORD_BOT_TOKEN || !SWEEP_ALERT_CHANNEL_ID) {
@@ -42,18 +61,43 @@ export async function startSweepDetector() {
     return;
   }
 
+  await subscribeTopCollections();
+
+  // Refresh the top-N list every 24h. We tear down existing sockets and
+  // rebuild against the freshly ordered list so newly trending collections
+  // get tracked and dropped ones get released.
+  setInterval(async () => {
+    try {
+      console.log("[sweep] daily refresh — re-fetching top collections by 1d volume");
+      await subscribeTopCollections();
+    } catch (e) {
+      console.error("[sweep] refresh failed", e?.message ?? e);
+    }
+  }, 24 * 60 * 60 * 1000);
+}
+
+async function subscribeTopCollections() {
   const slugs = await fetchTopSlugs(TOP_N);
   if (slugs.length === 0) {
-    console.error("[sweep] no slugs returned, aborting");
+    console.error("[sweep] no slugs returned, skipping");
     return;
   }
   console.log(`[sweep] tracking ${slugs.length} collections, threshold=${THRESHOLD} in ${WINDOW_MS}ms`);
 
+  // Tear down any existing clients before rebuilding.
+  if (activeClients.length) {
+    console.log(`[sweep] disconnecting ${activeClients.length} previous sockets`);
+    for (const c of activeClients) {
+      try { c?.disconnect?.(); } catch { /* ignore */ }
+    }
+    activeClients = [];
+    // Reset per-collection state so stale slugs don't leak counters.
+    sales.clear();
+  }
+
   // OpenSea Stream caps channel joins per WebSocket connection (~50). To track
   // 200 collections we shard the slug list across multiple Stream clients —
   // each opens its own websocket — and stagger joins to avoid rate limits.
-  const SHARD_SIZE = Number(process.env.SWEEP_SHARD_SIZE ?? "40");
-  const JOIN_DELAY_MS = Number(process.env.SWEEP_JOIN_DELAY_MS ?? "100");
   const shards = [];
   for (let i = 0; i < slugs.length; i += SHARD_SIZE) {
     shards.push(slugs.slice(i, i + SHARD_SIZE));
@@ -69,13 +113,13 @@ export async function startSweepDetector() {
       connectOptions: { transport: WebSocket },
       onError: (err) => console.error(`[sweep stream error shard ${s}]`, err?.message ?? err),
     });
+    activeClients.push(client);
     const sdkSocket =
       client?.socket?.socket ?? client?.socket ?? client?._socket ?? null;
     sdkSockets.push(sdkSocket);
 
     for (let i = 0; i < shard.length; i++) {
       const slug = shard[i];
-      // Stagger joins so Phoenix doesn't drop bursts.
       await new Promise((r) => setTimeout(r, JOIN_DELAY_MS));
       try {
         client.onItemSold(slug, (event) => handleSale(slug, event));
@@ -85,7 +129,6 @@ export async function startSweepDetector() {
     }
   }
 
-  // Report final tally once Phoenix has had time to process all joins.
   setTimeout(() => {
     let joined = 0;
     let failed = 0;
@@ -114,16 +157,6 @@ export async function startSweepDetector() {
       console.log(`[sweep] failed slugs (${failedSlugs.length}): ${failedSlugs.join(", ")}`);
     }
   }, 60_000);
-
-  // Refresh top list every 24h.
-  setInterval(async () => {
-    try {
-      const fresh = await fetchTopSlugs(TOP_N);
-      console.log(`[sweep] refreshed top list (${fresh.length} slugs). Restart needed for changes.`);
-    } catch (e) {
-      console.error("[sweep] refresh failed", e?.message ?? e);
-    }
-  }, 24 * 60 * 60 * 1000);
 }
 
 function handleSale(slug, event) {
@@ -216,7 +249,8 @@ async function fetchTopSlugs(limit) {
   while (slugs.length < limit) {
     const url = new URL("https://api.opensea.io/api/v2/collections");
     url.searchParams.set("chain", "ethereum");
-    url.searchParams.set("order_by", "market_cap");
+    // Rank by last 24h trading volume so we always track what's actually moving.
+    url.searchParams.set("order_by", "one_day_volume");
     url.searchParams.set("limit", "100");
     if (cursor) url.searchParams.set("next", cursor);
     const res = await fetch(url, { headers: { "x-api-key": OPENSEA_API_KEY, accept: "application/json" } });
