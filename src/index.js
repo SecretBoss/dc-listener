@@ -164,6 +164,14 @@ const sweepCommand = new SlashCommandBuilder()
       .addIntegerOption((o) =>
         o.setName("seconds").setDescription("Cooldown in seconds (>=0)").setRequired(true).setMinValue(0).setMaxValue(86400),
       ),
+  )
+  .addSubcommand((s) =>
+    s
+      .setName("role")
+      .setDescription("Set the role pinged on sweep alerts (use 0 to disable)")
+      .addStringOption((o) =>
+        o.setName("role_id").setDescription("Discord role ID, or 0 to disable").setRequired(true),
+      ),
   );
 
 async function registerSlashCommands(appId) {
@@ -205,13 +213,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     else if (sub === "threshold") cfg = setSweepConfig({ threshold: interaction.options.getInteger("value", true) });
     else if (sub === "window") cfg = setSweepConfig({ windowMs: interaction.options.getInteger("seconds", true) * 1000 });
     else if (sub === "cooldown") cfg = setSweepConfig({ cooldownMs: interaction.options.getInteger("seconds", true) * 1000 });
+    else if (sub === "role") cfg = setSweepConfig({ pingRoleId: interaction.options.getString("role_id", true) });
     else {
       await interaction.reply({ content: "unknown subcommand", flags: MessageFlags.Ephemeral });
       return;
     }
-    await interaction.reply(
-      `🧹 sweep config — threshold=**${cfg.threshold}** sales / **${Math.round(cfg.windowMs / 1000)}s** window, cooldown=**${Math.round(cfg.cooldownMs / 1000)}s**, tracking **${cfg.tracked}** collections`,
-    );
+    const pingTxt = cfg.pingRoleId && cfg.pingRoleId !== "0" ? `<@&${cfg.pingRoleId}>` : "disabled";
+    await interaction.reply({
+      content: `🧹 sweep config — threshold=**${cfg.threshold}** sales / **${Math.round(cfg.windowMs / 1000)}s** window, cooldown=**${Math.round(cfg.cooldownMs / 1000)}s**, ping=${pingTxt}, tracking **${cfg.tracked}** collections`,
+      allowed_mentions: { parse: [] },
+    });
   } catch (e) {
     await interaction.reply({ content: `error: ${e?.message ?? e}`, flags: MessageFlags.Ephemeral }).catch(() => {});
   }
