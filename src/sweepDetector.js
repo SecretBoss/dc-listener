@@ -38,6 +38,13 @@ let PING_ROLE_ID = "0";
 let ETH_USD = null;
 const TOP_N = Number(TOP_COLLECTIONS_COUNT);
 
+// Mega sweep tier — fires a second, more urgent alert when a collection
+// gets slammed extra hard. Hardcoded for now (not exposed via /sweep).
+const MEGA_THRESHOLD = 20;
+const MEGA_WINDOW_MS = 120_000; // 2 minutes
+const MEGA_COOLDOWN_MS = 600_000; // 10 minutes
+const lastMegaAlertAt = new Map(); // slug -> ts
+
 export function getSweepConfig() {
   return { threshold: THRESHOLD, windowMs: WINDOW_MS, cooldownMs: COOLDOWN_MS, pingRoleId: PING_ROLE_ID, ethUsd: ETH_USD, tracked: collectionMeta.size };
 }
@@ -220,16 +227,32 @@ function handleSale(slug, event) {
 
     const arr = sales.get(slug) ?? [];
     arr.push({ ts: now, priceEth, buyer: taker });
-    const cutoff = now - WINDOW_MS;
+    // Keep enough history for the largest active window (regular vs mega).
+    const maxWindow = Math.max(WINDOW_MS, MEGA_WINDOW_MS);
+    const cutoff = now - maxWindow;
     while (arr.length && arr[0].ts < cutoff) arr.shift();
     sales.set(slug, arr);
 
-    if (arr.length < THRESHOLD) return;
+    // Mega tier first (20+ in 2min) — more urgent, separate cooldown.
+    const megaCutoff = now - MEGA_WINDOW_MS;
+    const megaWindow = arr.filter((x) => x.ts >= megaCutoff);
+    if (megaWindow.length >= MEGA_THRESHOLD) {
+      const lastMega = lastMegaAlertAt.get(slug) ?? 0;
+      if (now - lastMega >= MEGA_COOLDOWN_MS) {
+        lastMegaAlertAt.set(slug, now);
+        void postSweepAlert(slug, meta, megaWindow, "mega");
+      }
+    }
+
+    // Regular tier.
+    const regCutoff = now - WINDOW_MS;
+    const regWindow = arr.filter((x) => x.ts >= regCutoff);
+    if (regWindow.length < THRESHOLD) return;
     const last = lastAlertAt.get(slug) ?? 0;
     if (now - last < COOLDOWN_MS) return;
 
     lastAlertAt.set(slug, now);
-    void postSweepAlert(slug, meta, arr.slice());
+    void postSweepAlert(slug, meta, regWindow, "regular");
   } catch (e) {
     console.error("[sweep handleSale]", e?.message ?? e);
   }
@@ -244,7 +267,7 @@ function fmtUsd(eth) {
   return ` (${formatted})`;
 }
 
-async function postSweepAlert(slug, meta, window) {
+async function postSweepAlert(slug, meta, window, tier = "regular") {
   const count = window.length;
   const totalEth = window.reduce((s, x) => s + x.priceEth, 0);
   const avgEth = totalEth / count;
@@ -252,11 +275,18 @@ async function postSweepAlert(slug, meta, window) {
   const uniqueBuyers = new Set(window.map((x) => x.buyer).filter(Boolean)).size;
   const slugUrl = `https://opensea.io/collection/${slug}`;
 
+  const isMega = tier === "mega";
+  const windowMs = isMega ? MEGA_WINDOW_MS : WINDOW_MS;
+  const title = isMega
+    ? `🚨 MEGA SWEEP: ${meta.name}`
+    : `🧹 Sweep detected: ${meta.name}`;
+  const color = isMega ? 0xef4444 : 0xf59e0b; // red vs amber
+
   const embed = {
-    title: `🧹 Sweep detected: ${meta.name}`,
+    title,
     url: slugUrl,
-    color: 0xf59e0b,
-    description: `**${count}** buys in the last ${Math.round(WINDOW_MS / 1000)}s · ${uniqueBuyers} buyer${uniqueBuyers === 1 ? "" : "s"}`,
+    color,
+    description: `**${count}** buys in the last ${Math.round(windowMs / 1000)}s · ${uniqueBuyers} buyer${uniqueBuyers === 1 ? "" : "s"}`,
     fields: [
       { name: "Total Volume", value: `${totalEth.toFixed(3)} ETH${fmtUsd(totalEth)}`, inline: true },
       { name: "Avg Price", value: `${avgEth.toFixed(4)} ETH${fmtUsd(avgEth)}`, inline: true },
