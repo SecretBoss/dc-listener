@@ -28,7 +28,56 @@ const {
   TOP_COLLECTIONS_COUNT = "200",
   INGEST_URL,
   INGEST_TOKEN,
+  ALCHEMY_API_KEY,
 } = process.env;
+
+// Cache wallet USD totals briefly so repeat sweeps don't hammer Alchemy.
+const walletValueCache = new Map(); // addr -> { usd, ts }
+const WALLET_VALUE_TTL_MS = 5 * 60_000;
+
+async function fetchWalletUsdValue(address) {
+  if (!ALCHEMY_API_KEY) return null;
+  const cached = walletValueCache.get(address);
+  if (cached && Date.now() - cached.ts < WALLET_VALUE_TTL_MS) return cached.usd;
+  try {
+    const res = await fetch(
+      `https://api.g.alchemy.com/data/v1/${ALCHEMY_API_KEY}/assets/tokens/by-address`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          addresses: [{ address, networks: ["eth-mainnet"] }],
+          withMetadata: false,
+          withPrices: true,
+        }),
+      },
+    );
+    if (!res.ok) return null;
+    const json = await res.json();
+    const tokens = json?.data?.tokens ?? [];
+    let total = 0;
+    for (const t of tokens) {
+      const balRaw = t?.tokenBalance;
+      const decimals = Number(t?.tokenMetadata?.decimals ?? t?.decimals ?? 18);
+      const price = Number(t?.tokenPrices?.[0]?.value ?? 0);
+      if (!balRaw || !price) continue;
+      try {
+        const bal = Number(BigInt(balRaw)) / Math.pow(10, decimals);
+        total += bal * price;
+      } catch { /* ignore */ }
+    }
+    walletValueCache.set(address, { usd: total, ts: Date.now() });
+    return total;
+  } catch (e) {
+    console.error("[sweep wallet value]", address, e?.message ?? e);
+    return null;
+  }
+}
+
+function shortAddr(a) {
+  if (!a || a.length < 10) return a ?? "";
+  return `${a.slice(0, 6)}...${a.slice(-4)}`;
+}
 
 // Mutable at runtime via setSweepConfig() so Discord commands can tune live.
 let THRESHOLD = Number(SWEEP_THRESHOLD);
@@ -296,6 +345,20 @@ async function postSweepAlert(slug, meta, window, tier = "regular") {
     timestamp: new Date().toISOString(),
   };
   if (meta.image) embed.thumbnail = { url: meta.image };
+
+  // Resolve unique buyer wallets (cap at 10) + lookup portfolio USD value.
+  const buyers = Array.from(new Set(window.map((x) => x.buyer).filter(Boolean))).slice(0, 10);
+  const values = await Promise.all(buyers.map((b) => fetchWalletUsdValue(b)));
+  const lines = buyers.map((b, i) => {
+    const v = values[i];
+    const valStr = v == null
+      ? "Total value: n/a"
+      : `Total value: $${v >= 1000 ? Math.round(v).toLocaleString("en-US") : v.toFixed(2)}`;
+    return `[${shortAddr(b)}](https://etherscan.io/address/${b}) | ${valStr}`;
+  });
+  if (lines.length) {
+    embed.fields.push({ name: "Wallets", value: lines.join("\n").slice(0, 1024), inline: false });
+  }
 
   const content = PING_ROLE_ID && PING_ROLE_ID !== "0" ? `<@&${PING_ROLE_ID}>` : undefined;
   const allowed_mentions = content ? { parse: [], roles: [PING_ROLE_ID] } : { parse: [] };
