@@ -35,10 +35,7 @@ const {
 const walletValueCache = new Map(); // addr -> { usd, ts }
 const WALLET_VALUE_TTL_MS = 5 * 60_000;
 
-async function fetchWalletUsdValue(address) {
-  if (!ALCHEMY_API_KEY) return null;
-  const cached = walletValueCache.get(address);
-  if (cached && Date.now() - cached.ts < WALLET_VALUE_TTL_MS) return cached.usd;
+async function fetchTokensUsdValue(address) {
   try {
     const res = await fetch(
       `https://api.g.alchemy.com/data/v1/${ALCHEMY_API_KEY}/assets/tokens/by-address`,
@@ -52,7 +49,7 @@ async function fetchWalletUsdValue(address) {
         }),
       },
     );
-    if (!res.ok) return null;
+    if (!res.ok) return 0;
     const json = await res.json();
     const tokens = json?.data?.tokens ?? [];
     let total = 0;
@@ -66,12 +63,115 @@ async function fetchWalletUsdValue(address) {
         total += bal * price;
       } catch { /* ignore */ }
     }
-    walletValueCache.set(address, { usd: total, ts: Date.now() });
     return total;
   } catch (e) {
-    console.error("[sweep wallet value]", address, e?.message ?? e);
-    return null;
+    console.error("[sweep token value]", address, e?.message ?? e);
+    return 0;
   }
+}
+
+// Cache OpenSea floor lookups by contract address (in ETH).
+const floorCache = new Map(); // contractAddr -> { eth, ts }
+const FLOOR_TTL_MS = 30 * 60_000;
+
+async function fetchOpenSeaFloorEth(contractAddr) {
+  if (!OPENSEA_API_KEY || !contractAddr) return 0;
+  const key = contractAddr.toLowerCase();
+  const cached = floorCache.get(key);
+  if (cached && Date.now() - cached.ts < FLOOR_TTL_MS) return cached.eth;
+  try {
+    const cRes = await fetch(
+      `https://api.opensea.io/api/v2/chain/ethereum/contract/${key}`,
+      { headers: { "x-api-key": OPENSEA_API_KEY, accept: "application/json" } },
+    );
+    if (!cRes.ok) { floorCache.set(key, { eth: 0, ts: Date.now() }); return 0; }
+    const cJson = await cRes.json();
+    const slug = cJson?.collection;
+    if (!slug) { floorCache.set(key, { eth: 0, ts: Date.now() }); return 0; }
+    const sRes = await fetch(
+      `https://api.opensea.io/api/v2/collections/${slug}/stats`,
+      { headers: { "x-api-key": OPENSEA_API_KEY, accept: "application/json" } },
+    );
+    if (!sRes.ok) { floorCache.set(key, { eth: 0, ts: Date.now() }); return 0; }
+    const sJson = await sRes.json();
+    const floor = Number(sJson?.total?.floor_price ?? 0);
+    floorCache.set(key, { eth: floor, ts: Date.now() });
+    return floor;
+  } catch (e) {
+    console.error("[opensea floor]", contractAddr, e?.message ?? e);
+    floorCache.set(key, { eth: 0, ts: Date.now() });
+    return 0;
+  }
+}
+
+async function fetchNftsUsdValue(address) {
+  try {
+    let totalEth = 0;
+    let pageKey = null;
+    let pages = 0;
+    const fallbackContracts = []; // owned>0 but no floor from Alchemy
+    do {
+      const url = new URL(
+        `https://eth-mainnet.g.alchemy.com/nft/v3/${ALCHEMY_API_KEY}/getContractsForOwner`,
+      );
+      url.searchParams.set("owner", address);
+      url.searchParams.set("withMetadata", "true");
+      url.searchParams.set("pageSize", "45");
+      if (pageKey) url.searchParams.set("pageKey", pageKey);
+      const res = await fetch(url, { headers: { accept: "application/json" } });
+      if (!res.ok) break;
+      const json = await res.json();
+      const contracts = json?.contracts ?? [];
+      for (const c of contracts) {
+        const owned = Number(c?.totalBalance ?? c?.numDistinctTokensOwned ?? 0);
+        if (owned <= 0 || c?.isSpam) continue;
+        const floor = Number(
+          c?.openSeaMetadata?.floorPrice ??
+          c?.opensea?.floorPrice ??
+          c?.floorPrice ??
+          0,
+        );
+        if (floor > 0) {
+          totalEth += owned * floor;
+        } else if (c?.address) {
+          fallbackContracts.push({ address: c.address, owned });
+        }
+      }
+      pageKey = json?.pageKey ?? null;
+      pages++;
+    } while (pageKey && pages < 5);
+
+    // Fallback to OpenSea for collections Alchemy didn't price.
+    // Cap to protect rate limits on whale wallets.
+    const capped = fallbackContracts.slice(0, 25);
+    const floors = await Promise.all(
+      capped.map((c) => fetchOpenSeaFloorEth(c.address)),
+    );
+    capped.forEach((c, i) => {
+      const f = floors[i] || 0;
+      if (f > 0) totalEth += c.owned * f;
+    });
+
+    if (!totalEth) return 0;
+    if (!ETH_USD) return 0;
+    return totalEth * ETH_USD;
+  } catch (e) {
+    console.error("[sweep nft value]", address, e?.message ?? e);
+    return 0;
+  }
+}
+
+async function fetchWalletUsdValue(address) {
+  if (!ALCHEMY_API_KEY) return null;
+  const cached = walletValueCache.get(address);
+  if (cached && Date.now() - cached.ts < WALLET_VALUE_TTL_MS) return cached.usd;
+  const [tokens, nfts] = await Promise.all([
+    fetchTokensUsdValue(address),
+    fetchNftsUsdValue(address),
+  ]);
+  const total = (tokens || 0) + (nfts || 0);
+  walletValueCache.set(address, { usd: total, ts: Date.now() });
+  return total;
 }
 
 function shortAddr(a) {
